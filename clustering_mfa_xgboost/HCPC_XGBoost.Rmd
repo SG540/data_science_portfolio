@@ -1,0 +1,253 @@
+---
+title: "Hyperparametrization of Hierarchical Clustering on Principal Components"
+output: HCPC_XGBoost_notebook
+---
+
+The script presents a way to select the number of clusters in a cluster analysis by testing its internal consistency via supervised machine learning (tree-based models, XGBoost). First, the clusters are created. Then XGBoost is used to train a model and the predict the clusters. The process is repeated k times (with k different folds) to see how stable the model is.
+
+```{r Libraries and Data Import, message=FALSE, warning=FALSE, include=FALSE}
+
+list.of.packages <- c('xgboost', 'readr', 'dplyr', 'FactoMineR', 
+                      'factoextra', 'caret', 'stringr', 
+                      'missMDA', 'SHAPforxgboost', 'missMethods')
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[, "Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+library(xgboost)
+library(readr)
+library(dplyr)
+library(FactoMineR)
+library(factoextra)
+library(caret)
+library(stringr)
+library(missMDA)
+library(SHAPforxgboost)
+library(missMethods)
+library(MASS)
+
+# simulating the data
+
+set.seed(159)
+n <- 30  
+A <- matrix(runif(n^2)*2 - 1, ncol = n) 
+Sigma <- t(A) %*% A
+data <- as.data.frame(mvrnorm(n = 250, mu = rep(0, 30), Sigma = Sigma))
+
+
+list_tests_MFA <- paste0("Var_", LETTERS[1:15])
+
+row.names(data) <- paste0("Group", 1:nrow(data))
+colnames(data) <- c(paste(list_tests_MFA, c(1, 2), sep = "_"),
+                    paste(list_tests_MFA, c(2, 1), sep = "_"))
+
+set.seed(1892)
+```
+
+
+```{r Parameters}
+
+ncp <- 10 # arbitrary number of dimensions
+
+groups_N <- NULL
+
+for (i in seq_along(list_tests_MFA)) {
+  v <- I(length(na.omit(str_extract(colnames(data), list_tests_MFA[[i]]))))
+  groups_N <- c(groups_N, v)
+}
+
+w <- abs(runif(nrow(data), min = 0, max = 1)) # a random vector of weights
+k <- 10
+flds <- createFolds(1:nrow(data), k) # k random folds for defining train/test data sets. This is necessary to test the ability of xgboost to correctly predict the clusters 
+
+# search grid for xgboost
+xgbGrid <- expand.grid(
+  eta=c(.05, .3),
+  max_depth=c(6, 10),
+  colsample_bytree=c(.5, .7),
+  num_class=c(3:6), # Number of HCPC clusters: parameter of interest in the hyper-parametrization
+  flds=seq_along(flds)
+)
+parameters_df <- xgbGrid[sample(nrow(xgbGrid)/1, dim(xgbGrid)[1]), ] # random subset of search grid rows. All rows selected by default (/1).
+```
+
+
+```{r Multiple Factor Analysis}
+
+# Multiple Factor Analysis missing data imputation
+
+data_NA <- delete_MCAR(data, 0.1) # adding missing data completely at random
+
+data_MFA <- 
+  imputeMFA(data_NA,
+            group=groups_N,
+            row.w = w,
+            type=c(rep("s", length(groups_N))),
+            ncp=ncp)$completeObs
+
+# Multiple Factor Analysis
+res.mfa <- MFA(data_MFA,
+               ncp = ncp,
+               group = groups_N,
+               row.w = w,
+               type = c(rep("s", length(groups_N))),
+               name.group = list_tests_MFA,
+               graph = FALSE)
+```
+
+
+```{r Hyperparametrization, message=FALSE}
+
+data_xgb <- res.mfa$ind$coord # the analysis is based on the MFA dimensions because the observed variables are reduced to few dimensions via MFA.
+lowest_error_df <- tibble()
+for (i in 1:nrow(parameters_df))
+      
+    {
+      
+      set.seed(2006)
+      
+      # HCPC analysis
+      res.hcpc_mfa <- HCPC(res.mfa, nb.clust=parameters_df$num_class[[i]], proba=0.001,
+                           metric = "manhattan", graph = FALSE, consol = TRUE)
+      
+      # XGBoost analysis
+      label <- as.numeric(res.hcpc_mfa$data.clust[, "clust"]) - 1
+     
+      train.data <- data_xgb[-parameters_df$flds[[i]], ]
+      train.label <- label[-parameters_df$flds[[i]]]
+      
+      
+      
+      xgb.train <- xgb.DMatrix(data = as.matrix(train.data), label = train.label)
+      
+      
+      xgbcv <- xgb.cv( data = xgb.train,
+                       booster = "gbtree",
+                       objective = "multi:softprob",
+                       max_depth = parameters_df$max_depth[[i]],
+                       eta = parameters_df$eta[[i]],
+                       subsample = 1,
+                       colsample_bytree = parameters_df$colsample_bytree[[i]],
+                       gamma = 0,
+                       nrounds = 10000,
+                       eval_metric = "mlogloss",
+                       print_every_n = 100,
+                       num_class = parameters_df$num_class[[i]],
+                       nfold = 5, showsd = T, stratified = T,
+                       early_stopping_rounds = 20, maximize = F)
+      
+      
+      lowest_error <- as_tibble(xgbcv$evaluation_log[
+        which.min(xgbcv$evaluation_log$test_mlogloss_mean), ])
+      lowest_error_df <- bind_rows(lowest_error_df,lowest_error[, -1])
+      
+      
+    }
+```
+
+
+```{r Training and Testing}
+
+hyper_parameters_df <- bind_cols(lowest_error_df, parameters_df) %>% 
+       group_by(num_class, flds) %>% slice_min(n = 1, test_mlogloss_mean)
+pred_error_list <- list()
+for (j in 1:nrow(hyper_parameters_df))
+    
+  {
+    
+    set.seed(2006)
+    
+    # HCPC analysis
+    res.hcpc_mfa <- HCPC(res.mfa, nb.clust = hyper_parameters_df$num_class[[j]],
+                         proba = 0.001,
+                         metric = "manhattan",
+                         graph = FALSE, consol = TRUE) 
+    
+    # XGBoost analysis
+    label <- as.numeric(res.hcpc_mfa$data.clust[,"clust"]) - 1
+ 
+    train.data <- data_xgb[-flds[[hyper_parameters_df$flds[[j]]]], ]
+    train.label <- label[-flds[[hyper_parameters_df$flds[[j]]]]]
+    
+    
+    xgb.train <- xgb.DMatrix(data = as.matrix(train.data), label = train.label)
+    
+    
+    params <- list(
+      
+      max_depth = hyper_parameters_df$max_depth[[j]],
+      eta = hyper_parameters_df$eta[[j]],
+      subsample = 1,
+      colsample_bytree = hyper_parameters_df$colsample_bytree[[j]],
+      num_class = hyper_parameters_df$num_class[[j]]
+    
+    )
+    
+    
+    test.data <- data_xgb[flds[[hyper_parameters_df$flds[[j]]]], ]
+    test.label <- label[flds[[hyper_parameters_df$flds[[j]]]]]
+    
+    xgb.test <- xgb.DMatrix(data = as.matrix(test.data), label = test.label)
+    
+    
+    xgb.fit <- xgb.train(
+      params = params,
+      data = xgb.train,
+      nrounds = 100000,
+      eval_metric = "mlogloss",
+      #nthreads=1,
+      early_stopping_rounds = 50,
+      watchlist = list(val1 = xgb.train, val2 = xgb.test),
+      print_every_n = 100,
+      verbose = 1
+    )
+    
+    
+    xgb.pred <- predict(xgb.fit, test.data, reshape = T)
+    xgb.pred <- as.data.frame(xgb.pred)
+    
+    pred_test_df <- cbind.data.frame(xgb.pred, test.label)
+    
+    pred_error_list[[j]] <- pred_test_df
+    
+  }
+  
+```
+ 
+ 
+```{r Visualize results}
+
+gg <- unlist(lapply(pred_error_list, function(x) {sum(as.numeric(x[,1] == x[,2]))/nrow(x)}))
+vv <- as.data.frame(matrix(gg, nrow = length(flds)))
+colnames(vv) <- paste0("num_clust_", unique(xgbGrid$num_class))
+row.names(vv) <- paste0("num_fold_", unique(xgbGrid$flds))
+View(vv)
+
+```
+ 
+
+```{r An example with clustering SHAP value}
+
+# assuming 4 clusters
+    # HCPC analysis
+res.hcpc_mfa <- HCPC(res.mfa, nb.clust = 4, proba = 0.001,
+                         metric = "manhattan", graph = FALSE, consol = TRUE) 
+    
+    # XGBoost analysis
+label <- as.numeric(res.hcpc_mfa$data.clust[, "clust"]) - 1
+ 
+train_data <- as.matrix(data_xgb)
+colnames(train_data) <- paste0("Dim_", 1:10)
+    
+mod1 <- xgboost::xgboost(
+     data = train_data, label = label, gamma = 0, eta = 1,
+     lambda = 0, nrounds = 1, verbose = FALSE)
+    
+shap_values <- shap.values(xgb_model = mod1,
+                           X_train = train_data)
+shap_values$mean_shap_score
+shap_values$shap_score
+plot_data_shap <- shap.prep.stack.data(shap_contrib = shap_values$shap_score,
+                                         n_groups = 4, top_n = 4)
+shap.plot.force_plot_bygroup(plot_data_shap)    
+  
+```
